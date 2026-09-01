@@ -172,15 +172,25 @@ impl From<Name<'_>> for JSONSchema {
                             warn!(name=?other, "custom scalar missing from custom_scalar_map");
                             cache.insert(
                                 other.to_string(),
-                                with_desc(JSONSchema::default(), &default_scalar_description)
-                                    .into(),
+                                with_desc(
+                                    // Exclude null here so a nullable `$ref` can use
+                                    // `oneOf` with a null branch without both sides
+                                    // matching `null`.
+                                    json_schema!({"not": {"type": "null"}}),
+                                    &default_scalar_description,
+                                )
+                                .into(),
                             );
                         }
                     } else {
                         warn!(name=?other, "custom scalars aren't currently supported without a custom_scalar_map");
                         cache.insert(
                             other.to_string(),
-                            with_desc(JSONSchema::default(), &default_scalar_description).into(),
+                            with_desc(
+                                json_schema!({"not": {"type": "null"}}),
+                                &default_scalar_description,
+                            )
+                            .into(),
                         );
                     }
 
