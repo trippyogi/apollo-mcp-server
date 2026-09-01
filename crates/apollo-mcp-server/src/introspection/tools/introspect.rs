@@ -82,29 +82,35 @@ impl Introspect {
         }
         let shaken = tree_shaker.shaken().unwrap_or_else(|schema| schema.partial);
 
-        Ok(CallToolResult::success(
-            shaken
-                .types
-                .iter()
-                .filter(|(_name, extended_type)| {
-                    !extended_type.is_built_in()
-                        && schema
-                            .root_operation(OperationType::Mutation)
-                            .is_none_or(|root_name| {
-                                // Allow introspection of the mutation type itself even when mutations are disabled
-                                extended_type.name() != root_name
-                                    || type_name == root_name.as_str()
-                                    || self.allow_mutations
-                            })
-                        && schema
-                            .root_operation(OperationType::Subscription)
-                            .is_none_or(|root_name| extended_type.name() != root_name)
-                })
-                .map(|(_, extended_type)| extended_type)
-                .map(|extended_type| self.serialize(extended_type))
-                .map(ContentBlock::text)
-                .collect(),
-        ))
+        // The tree shaker already retains used custom directive definitions
+        // (and their argument types). Project those into the response; types
+        // alone hide the definition even when the application is visible.
+        let directives = shaken
+            .directive_definitions
+            .iter()
+            .filter(|(_, def)| !def.is_built_in())
+            .map(|(_, def)| ContentBlock::text(def.serialize().to_string()));
+
+        let types = shaken
+            .types
+            .iter()
+            .filter(|(_, extended_type)| {
+                !extended_type.is_built_in()
+                    && schema
+                        .root_operation(OperationType::Mutation)
+                        .is_none_or(|root_name| {
+                            // Allow introspection of the mutation type itself even when mutations are disabled
+                            extended_type.name() != root_name
+                                || type_name == root_name.as_str()
+                                || self.allow_mutations
+                        })
+                    && schema
+                        .root_operation(OperationType::Subscription)
+                        .is_none_or(|root_name| extended_type.name() != root_name)
+            })
+            .map(|(_, extended_type)| ContentBlock::text(self.serialize(extended_type)));
+
+        Ok(CallToolResult::success(directives.chain(types).collect()))
     }
 
     fn serialize(&self, extended_type: &ExtendedType) -> String {
@@ -307,6 +313,278 @@ mod tests {
         assert!(
             content.contains("type Mutation"),
             "Should contain Mutation type definition"
+        );
+    }
+
+    fn parse_schema(sdl: &str) -> Arc<RwLock<Valid<Schema>>> {
+        Arc::new(RwLock::new(
+            Schema::parse(sdl, "schema.graphql")
+                .expect("Failed to parse schema")
+                .validate()
+                .expect("Failed to validate schema"),
+        ))
+    }
+
+    fn text_content(result: &CallToolResult) -> Vec<String> {
+        result
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn introspect_type(
+        sdl: &str,
+        type_name: &str,
+        depth: usize,
+        minify: bool,
+    ) -> Vec<String> {
+        let schema = parse_schema(sdl);
+        let introspect = Introspect::new(schema, Some("Query".to_string()), None, minify, None);
+        let result = introspect
+            .execute(Input {
+                type_name: type_name.to_string(),
+                depth,
+            })
+            .await
+            .expect("Introspect execution failed");
+        text_content(&result)
+    }
+
+    #[tokio::test]
+    async fn tree_shaker_retains_used_directive_definition() {
+        let sdl = r#"
+            directive @auth(role: String!) on FIELD_DEFINITION
+            directive @unused(reason: String) on OBJECT
+
+            type Query {
+              secret: String @auth(role: "admin")
+            }
+        "#;
+        let schema = parse_schema(sdl);
+        let schema_guard = schema.read().await;
+        let mut tree_shaker = SchemaTreeShaker::new(&schema_guard);
+        let query = schema_guard
+            .types
+            .get("Query")
+            .expect("Query type must exist");
+        tree_shaker.retain_type(query, None, DepthLimit::Limited(1));
+        let shaken = tree_shaker.shaken().unwrap_or_else(|schema| schema.partial);
+        let shaken_sdl = shaken.to_string();
+        assert!(
+            shaken_sdl.contains("directive @auth"),
+            "tree shaker already retains used custom directives: {shaken_sdl}"
+        );
+        assert!(
+            !shaken_sdl.contains("directive @unused"),
+            "tree shaker must omit unused custom directives: {shaken_sdl}"
+        );
+    }
+
+    #[tokio::test]
+    async fn field_applied_custom_directive_definition_is_returned() {
+        let content = introspect_type(
+            r#"
+            directive @auth(role: String!) on FIELD_DEFINITION
+            directive @unused(reason: String) on OBJECT
+
+            type Query {
+              secret: String @auth(role: "admin")
+            }
+            "#,
+            "Query",
+            1,
+            false,
+        )
+        .await;
+        let joined = content.join("\n");
+        assert!(
+            joined.contains("directive @auth(role: String!) on FIELD_DEFINITION"),
+            "missing @auth definition: {joined}"
+        );
+        assert!(
+            joined.contains("@auth(role: \"admin\")"),
+            "missing @auth application: {joined}"
+        );
+        assert!(
+            !joined.contains("directive @unused"),
+            "unused directive must be omitted: {joined}"
+        );
+        assert_eq!(
+            content
+                .iter()
+                .filter(|block| block.contains("directive @auth"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn type_applied_custom_directive_definition_is_returned() {
+        let content = introspect_type(
+            r#"
+            directive @owner(team: String!) on OBJECT
+
+            type Query @owner(team: "platform") {
+              id: ID
+            }
+            "#,
+            "Query",
+            1,
+            false,
+        )
+        .await;
+        let joined = content.join("\n");
+        assert!(
+            joined.contains("directive @owner(team: String!) on OBJECT"),
+            "{joined}"
+        );
+        assert!(joined.contains("@owner(team: \"platform\")"), "{joined}");
+    }
+
+    #[tokio::test]
+    async fn directive_argument_custom_type_is_retained() {
+        // SchemaTreeShaker decrements depth once for directive argument types
+        // and again for nested input fields. Depth 1 therefore keeps @auth but
+        // not AuthContext/Role; depth 3 matches should_retain_custom_directives.
+        let content = introspect_type(
+            r#"
+            enum Role { ADMIN USER }
+            input AuthContext { role: Role! }
+            directive @auth(ctx: AuthContext!) on FIELD_DEFINITION
+
+            type Query {
+              secret: String @auth(ctx: { role: ADMIN })
+            }
+            "#,
+            "Query",
+            3,
+            false,
+        )
+        .await;
+        let joined = content.join("\n");
+        assert!(
+            joined.contains("directive @auth(ctx: AuthContext!) on FIELD_DEFINITION"),
+            "{joined}"
+        );
+        assert!(joined.contains("enum Role"), "{joined}");
+        assert!(joined.contains("input AuthContext"), "{joined}");
+    }
+
+    #[tokio::test]
+    async fn repeated_application_returns_one_definition() {
+        let content = introspect_type(
+            r#"
+            directive @auth(role: String!) on FIELD_DEFINITION
+
+            type Query {
+              a: String @auth(role: "admin")
+              b: String @auth(role: "user")
+            }
+            "#,
+            "Query",
+            1,
+            false,
+        )
+        .await;
+        assert_eq!(
+            content
+                .iter()
+                .filter(|block| block.contains("directive @auth"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn builtin_directive_definitions_are_not_dumped() {
+        let content = introspect_type(
+            r#"
+            type Query {
+              legacy: String @deprecated(reason: "use secret")
+              secret: String
+            }
+            "#,
+            "Query",
+            1,
+            false,
+        )
+        .await;
+        let joined = content.join("\n");
+        assert!(joined.contains("@deprecated"), "{joined}");
+        assert!(
+            !joined.contains("directive @deprecated"),
+            "built-in directive definitions must not be dumped: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_directive_respects_introspection_depth() {
+        let sdl = r#"
+            directive @auth(role: String!) on FIELD_DEFINITION
+
+            type Query {
+              user: User
+            }
+
+            type User {
+              secret: String @auth(role: "admin")
+            }
+        "#;
+        let shallow = introspect_type(sdl, "Query", 1, false).await.join("\n");
+        assert!(
+            !shallow.contains("directive @auth"),
+            "depth 1 should not retain nested @auth: {shallow}"
+        );
+
+        let deep = introspect_type(sdl, "Query", 2, false).await.join("\n");
+        assert!(
+            deep.contains("directive @auth(role: String!) on FIELD_DEFINITION"),
+            "depth 2 should retain nested @auth: {deep}"
+        );
+    }
+
+    #[tokio::test]
+    async fn regular_serialization_is_deterministic() {
+        let sdl = r#"
+            directive @auth(role: String!) on FIELD_DEFINITION
+            type Query {
+              secret: String @auth(role: "admin")
+            }
+        "#;
+        let first = introspect_type(sdl, "Query", 1, false).await;
+        let second = introspect_type(sdl, "Query", 1, false).await;
+        assert_eq!(first, second);
+    }
+
+    #[tokio::test]
+    async fn minify_returns_standard_sdl_directive_definition() {
+        // MinifyExt only minifies type SDL and selected applications such as
+        // @deprecated. There is no custom directive-definition minifier, so
+        // definitions are returned as regular SDL even in minify mode.
+        let content = introspect_type(
+            r#"
+            directive @auth(role: String!) on FIELD_DEFINITION
+            type Query {
+              secret: String @auth(role: "admin")
+            }
+            "#,
+            "Query",
+            1,
+            true,
+        )
+        .await;
+        let joined = content.join("\n");
+        assert!(
+            joined.contains("directive @auth(role: String!) on FIELD_DEFINITION"),
+            "minify mode should still return standard SDL for custom directive definitions: {joined}"
+        );
+        assert!(
+            content.iter().any(|block| block.starts_with("T:")),
+            "retained types should still be minified: {joined}"
         );
     }
 }
