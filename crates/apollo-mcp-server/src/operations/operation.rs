@@ -780,6 +780,14 @@ mod tests {
         source_text: &str,
         custom_scalar_map: Option<&CustomScalarMap>,
     ) -> Value {
+        input_schema_for_schema(source_text, &SCHEMA, custom_scalar_map)
+    }
+
+    fn input_schema_for_schema(
+        source_text: &str,
+        graphql_schema: &Schema,
+        custom_scalar_map: Option<&CustomScalarMap>,
+    ) -> Value {
         let operation = Operation::from_raw(
             RawOperation {
                 source_text: source_text.to_string(),
@@ -787,7 +795,7 @@ mod tests {
                 variables: None,
                 source_path: None,
             },
-            &SCHEMA,
+            graphql_schema,
             custom_scalar_map,
             MutationMode::None,
             false,
@@ -1068,6 +1076,181 @@ mod tests {
         assert_valid(
             &require_every_property(&unmapped),
             &serde_json::json!({"b": null}),
+        );
+    }
+
+    /// GraphQL schema used to check that mapped custom-scalar JSON Schema
+    /// cannot override GraphQL nullability, including inside input objects.
+    fn mapped_foo_graphql_schema() -> Schema {
+        Schema::parse(
+            r#"
+                type Query { id: String }
+                """Foo is a mapped custom scalar"""
+                scalar Foo
+                input FooInput {
+                    optional: Foo
+                    required: Foo!
+                }
+                input RecursiveFoo {
+                    child: RecursiveFoo
+                    value: Foo
+                    requiredValue: Foo!
+                }
+            "#,
+            "mapped-foo.graphql",
+        )
+        .expect("mapped Foo schema should parse")
+        .validate()
+        .expect("mapped Foo schema should be valid")
+        .into_inner()
+    }
+
+    fn mapped_foo_input_schema(source_text: &str, scalar_schema_json: &str) -> Value {
+        let custom_scalar_map = CustomScalarMap::from_str(scalar_schema_json).unwrap();
+        input_schema_for_schema(
+            source_text,
+            &mapped_foo_graphql_schema(),
+            Some(&custom_scalar_map),
+        )
+    }
+
+    /// GraphQL nullability is authoritative: `Foo` accepts null, `Foo!` rejects
+    /// it. The operator-supplied custom scalar schema only constrains non-null
+    /// values and must not make a nullable wrapper reject null.
+    fn assert_mapped_scalar_nullability(
+        scalar_schema_json: &str,
+        valid_non_null: &Value,
+        also_accepted_non_null: &[Value],
+        rejected_non_null: &[Value],
+    ) {
+        let nullable = mapped_foo_input_schema("query Q($value: Foo) { id }", scalar_schema_json);
+        let non_null = mapped_foo_input_schema("query Q($value: Foo!) { id }", scalar_schema_json);
+
+        assert_valid(&nullable, &serde_json::json!({"value": null}));
+        assert_valid(&nullable, &serde_json::json!({"value": valid_non_null}));
+        assert_valid(
+            &require_every_property(&nullable),
+            &serde_json::json!({"value": null}),
+        );
+
+        assert_invalid(&non_null, &serde_json::json!({"value": null}));
+        assert_valid(&non_null, &serde_json::json!({"value": valid_non_null}));
+
+        for extra in also_accepted_non_null {
+            assert_valid(&nullable, &serde_json::json!({"value": extra}));
+            assert_valid(&non_null, &serde_json::json!({"value": extra}));
+        }
+        for rejected in rejected_non_null {
+            assert_invalid(&nullable, &serde_json::json!({"value": rejected}));
+            assert_invalid(&non_null, &serde_json::json!({"value": rejected}));
+        }
+
+        let nested =
+            mapped_foo_input_schema("query Q($input: FooInput) { id }", scalar_schema_json);
+        assert_valid(
+            &nested,
+            &serde_json::json!({"input": {"optional": null, "required": valid_non_null}}),
+        );
+        assert_valid(
+            &nested,
+            &serde_json::json!({"input": {"required": valid_non_null}}),
+        );
+        assert_invalid(
+            &nested,
+            &serde_json::json!({"input": {"optional": valid_non_null, "required": null}}),
+        );
+        assert_valid(&nested, &serde_json::json!({"input": null}));
+        assert_valid(
+            &require_every_property(&nested),
+            &serde_json::json!({"input": {"optional": null, "required": valid_non_null}}),
+        );
+
+        let nested_required =
+            mapped_foo_input_schema("query Q($input: FooInput!) { id }", scalar_schema_json);
+        assert_invalid(&nested_required, &serde_json::json!({"input": null}));
+        assert_valid(
+            &nested_required,
+            &serde_json::json!({"input": {"optional": null, "required": valid_non_null}}),
+        );
+
+        let recursive =
+            mapped_foo_input_schema("query Q($input: RecursiveFoo) { id }", scalar_schema_json);
+        assert_valid(
+            &recursive,
+            &serde_json::json!({
+                "input": {
+                    "value": null,
+                    "requiredValue": valid_non_null,
+                    "child": {
+                        "value": null,
+                        "requiredValue": valid_non_null
+                    }
+                }
+            }),
+        );
+        assert_invalid(
+            &recursive,
+            &serde_json::json!({
+                "input": {
+                    "value": valid_non_null,
+                    "requiredValue": null
+                }
+            }),
+        );
+    }
+
+    #[test]
+    fn mapped_scalar_type_array_accepting_null() {
+        // A. Operator schema already admits null via a type array.
+        assert_mapped_scalar_nullability(
+            r#"{ "Foo": { "type": ["string", "null"] } }"#,
+            &serde_json::json!("hello"),
+            &[],
+            &[serde_json::json!(1), serde_json::json!(true)],
+        );
+    }
+
+    #[test]
+    fn mapped_scalar_any_of_accepting_null() {
+        // B. Operator schema already admits null via anyOf.
+        assert_mapped_scalar_nullability(
+            r#"{
+                "Foo": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "null"}
+                    ]
+                }
+            }"#,
+            &serde_json::json!("hello"),
+            &[],
+            &[serde_json::json!(1), serde_json::json!(true)],
+        );
+    }
+
+    #[test]
+    fn mapped_scalar_open_schema() {
+        // C. Open schema remains permissive for every non-null value.
+        assert_mapped_scalar_nullability(
+            r#"{ "Foo": {} }"#,
+            &serde_json::json!("hello"),
+            &[
+                serde_json::json!(1),
+                serde_json::json!(true),
+                serde_json::json!({"any": "object"}),
+            ],
+            &[],
+        );
+    }
+
+    #[test]
+    fn mapped_scalar_non_null_string_schema() {
+        // D. Ordinary non-null operator schema.
+        assert_mapped_scalar_nullability(
+            r#"{ "Foo": { "type": "string" } }"#,
+            &serde_json::json!("hello"),
+            &[],
+            &[serde_json::json!(1), serde_json::json!(true)],
         );
     }
 
@@ -3147,7 +3330,16 @@ mod tests {
                 "definitions": Object {
                     "RealCustomScalar": Object {
                         "description": String("RealCustomScalar exists"),
-                        "type": String("string"),
+                        "allOf": Array [
+                            Object {
+                                "type": String("string"),
+                            },
+                            Object {
+                                "not": Object {
+                                    "type": String("null"),
+                                },
+                            },
+                        ],
                     },
                 },
             },

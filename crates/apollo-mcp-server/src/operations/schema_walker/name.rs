@@ -143,7 +143,9 @@ impl From<Name<'_>> for JSONSchema {
                     JSONSchema::new_ref(format!("#/definitions/{other}"))
                 }
 
-                // Custom scalars need to be opaquely copied over as types with no further processing
+                // Custom scalars are cached as `$ref` targets. The operator
+                // schema is preserved for non-null values; GraphQL nullability
+                // is applied by the outer walker.
                 Some(ExtendedType::Scalar(scalar)) => {
                     // The default scalar description should always be from the scalar in the schema itself
                     let default_scalar_description =
@@ -159,10 +161,23 @@ impl From<Name<'_>> for JSONSchema {
                                 .and_then(Value::as_str)
                                 .map(str::to_string);
 
+                            // GraphQL nullability is applied by the outer walker.
+                            // Intersect the operator schema with "not null" so a
+                            // schema that already admits null cannot:
+                            // - weaken `Foo!` into accepting null, or
+                            // - make nullable `Foo` fail `oneOf` because both
+                            //   the `$ref` and the null branch match.
+                            // Non-null values still have to satisfy the original
+                            // operator schema; we do not rewrite its keywords.
                             cache.insert(
                                 other.to_string(),
                                 with_desc(
-                                    custom_scalar_schema_object.clone(),
+                                    json_schema!({
+                                        "allOf": [
+                                            custom_scalar_schema_object,
+                                            {"not": {"type": "null"}},
+                                        ]
+                                    }),
                                     // The description could have been overridden by the custom schema, so we prioritize it here
                                     &description.or(default_scalar_description),
                                 )
